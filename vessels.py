@@ -93,3 +93,86 @@ def run_pipeline(im, eye):
     _, mask = segment(v, eye)
     n, big = pieces(mask)
     return mask, int(skeletonize(mask).sum()), n, big
+
+
+def iaaft(im, n_iter=30, seed=0):
+    """IAAFT surrogate (Schreiber & Schmitz 1996), applied to an image.
+    Keeps the exact brightness histogram and (almost exactly) the power
+    spectrum of the original, with the arrangement randomised."""
+    rs = np.random.default_rng(seed)
+    amp = np.abs(np.fft.rfft2(im))
+    sorted_vals = np.sort(im.ravel())
+    s = rs.permutation(im.ravel()).reshape(im.shape)
+    for _ in range(n_iter):
+        S = np.fft.rfft2(s)
+        s = np.fft.irfft2(amp * np.exp(1j * np.angle(S)), s=im.shape)  # match spectrum
+        rank = np.argsort(np.argsort(s.ravel()))
+        s = sorted_vals[rank].reshape(im.shape)                         # match histogram
+    return s
+
+
+def longest_piece(mask):
+    """Centreline length (px) of the largest connected piece.
+    Absolute, so it does not inflate when only a few specks are found."""
+    from skimage.morphology import skeletonize
+    lab, n = ndi.label(mask, np.ones((3, 3)))
+    if n == 0:
+        return 0
+    sz = np.bincount(lab.ravel())[1:]
+    return int(skeletonize(lab == np.argmax(sz) + 1).sum())
+
+
+def structure_test(im, eye, n_surr=19, seed=0):
+    """Per-image surrogate test against IAAFT surrogates.
+    H0: the segmentation is what texture alone would give.
+    One-sided rank p-value: p = (1 + #surrogates >= real) / (n_surr + 1)."""
+    def stats(x):
+        m, _, _, share = run_pipeline(x, eye)
+        return share, longest_piece(m)
+    real = np.array(stats(im))
+    null = np.array([stats(iaaft(im, seed=seed + k)) for k in range(n_surr)])
+    p = (1 + (null >= real).sum(0)) / (n_surr + 1)
+    z = (real - null.mean(0)) / (null.std(0) + 1e-12)
+    return real, null, p, z
+
+
+def local_norm(g, s=40):
+    """Local contrast normalisation: subtract the local mean, divide by the local
+    spread, so a faint vessel in the periphery looks as strong as one near the disc."""
+    m = ndi.gaussian_filter(g, s)
+    sd = np.sqrt(ndi.gaussian_filter((g - m) ** 2, s))
+    return (g - m) / (sd + 0.02)
+
+
+def segment_hyst(v, eye, low_frac=0.5, min_size=100):
+    """Hysteresis threshold: keep pixels above low_frac * Otsu ONLY if they connect
+    to a pixel above the Otsu cut. Thin vessels stay attached to the tree."""
+    from skimage.filters import apply_hysteresis_threshold
+    th = otsu(v[eye])
+    mask = apply_hysteresis_threshold(v * eye, low_frac * th, th) & eye
+    lab, _ = ndi.label(mask, np.ones((3, 3)))
+    sz = np.bincount(lab.ravel())[1:]
+    mask &= np.isin(lab, np.nonzero(sz >= min_size)[0] + 1)
+    return th, mask
+
+
+def pipeline_v2(im, eye, local=True, hyst=True):
+    """Pipeline with optional local contrast normalisation and hysteresis.
+    local=False, hyst=False reproduces the original pipeline exactly."""
+    g = local_norm(im) if local else im
+    v = tubes(g) * eye
+    _, mask = segment_hyst(v, eye) if hyst else segment(v, eye)
+    return mask
+
+
+def dice(a, b):
+    return 2 * (a & b).sum() / (a.sum() + b.sum() + 1e-12)
+
+
+def cl_dice(pred, truth):
+    """Centreline Dice (Shit et al. 2021): topology-aware overlap."""
+    from skimage.morphology import skeletonize
+    sp, st = skeletonize(pred), skeletonize(truth)
+    tprec = (sp & truth).sum() / (sp.sum() + 1e-12)
+    tsens = (st & pred).sum() / (st.sum() + 1e-12)
+    return 2 * tprec * tsens / (tprec + tsens + 1e-12)
