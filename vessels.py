@@ -73,3 +73,23 @@ def pieces(mask):
     lab, n = ndi.label(mask, np.ones((3, 3)))
     sz = np.bincount(lab.ravel())[1:]
     return n, float(sz.max() / sz.sum()) if n else 0.0
+
+
+def surrogate(im, f, seed=0):
+    """Phase surrogate. Keep every spatial frequency at its measured amplitude,
+    rotate the phases a fraction f of the way towards random.
+    f=0 is the original image; f=1 keeps texture but destroys arrangement."""
+    rs = np.random.default_rng(seed)
+    F = np.fft.fft2(im)
+    P = np.angle(np.fft.fft2(rs.normal(size=im.shape)))   # symmetric random phases
+    g = np.real(np.fft.ifft2(np.abs(F) * np.exp(1j * ((1 - f) * np.angle(F) + f * P))))
+    return (g - g.mean()) / g.std() * im.std() + im.mean()
+
+
+def run_pipeline(im, eye):
+    """Filter -> Otsu -> clean. Returns (mask, centreline length, pieces, largest share)."""
+    from skimage.morphology import skeletonize
+    v = tubes(im) * eye
+    _, mask = segment(v, eye)
+    n, big = pieces(mask)
+    return mask, int(skeletonize(mask).sum()), n, big
